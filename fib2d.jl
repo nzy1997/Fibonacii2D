@@ -16,19 +16,20 @@ function fib2d(n::Int, m::Int; periodic=false)
     return solve(tnet, CountingAll())[]
 end
 
-function fib2d_bmps(n::Int,m::Int)
-    tensors = get_tensors(n,m; p = 9223372036854775783)
+function fib2d_bmps(n::Int,m::Int; p = 9223372036854775783)
+    tensors = get_tensors(n,m; p)
     return contract_tensors(tensors)
 end
 
 # L is the layer length
-function get_tensors(L::Int,m::Int; p = 1021)
+function get_tensors(L::Int, m::Int; p = 1021)
+    T = eltype(p)
     # Create Boltzmann matrix
-    A = Mod{p, Int}[1 1; 1 0]
+    A = Mod{p, T}[1 1; 1 0]
     l, u = lu(A; allowsingular = true)
 
-    one_tensor = Mod{p, Int}[1, 1]
-    one_row = Mod{p, Int}[1 1]
+    one_tensor = Mod{p, T}[1, 1]
+    one_row = Mod{p, T}[1 1]
 
     code = ein"ia,aj,ak,la,a->ijkl"
 
@@ -44,7 +45,7 @@ function get_tensors(L::Int,m::Int; p = 1021)
     t_rd = code(u, one_row', one_row', u, one_tensor)
 
     # Initialize tensors array
-    tensors = Vector{Vector{Array{Mod{p, Int}, 4}}}()
+    tensors = Vector{Vector{Array{Mod{p, T}, 4}}}()
     push!(tensors, [i == 1 ? t_lu :
                     i == L ? t_ru :
                     t_up for i in 1:L])
@@ -68,7 +69,21 @@ function contract_tensors(tensors)
     for i in 1:(L-1)  # mps on the boundary is eating the next mpo, for L-1 times
         @show i
         tensors[i+1] = eat(tensors[i], tensors[i+1])
-        compress!(tensors[i+1]; rounds = 1)
+
+        # if i == 2
+        #     mps2 = copy(tensors[i+1])
+        #     for j in 1:(L-1)
+        #         mps2[j+1] = reshape(ein"ijkl,kabc -> ijlabc"(mps2[j], mps2[j+1]), 1, :, size(mps2[j+1],3), 1)
+        #     end
+
+            compress!(tensors[i+1]; rounds = 1)
+        #     mps = copy(tensors[i+1])
+        #     for j in 1:(L-1)
+        #         mps[j+1] = reshape(ein"ijkl,kabc -> ijlabc"(mps[j], mps[j+1]), 1, :, size(mps[j+1],3), 1)
+        #     end
+        #     # @show mps[end][1]
+        #     # @show mps2[end][1]
+        # end
     end
     for j in 1:(L-1)
         tensors[end][j+1] = reshape(ein"ijkl,kabc -> ijlabc"(tensors[end][j], tensors[end][j+1]), 1, 1, :, 1)
@@ -82,27 +97,29 @@ function compress!(mps; rounds = 1)
     for _ in 1:rounds
         for i in 1:(L-1)
             p, l, u, q = lu_with_complete_pivot(reshape(mps[i], size(mps[i], 1) * size(mps[i], 2), :))
-            mps[i] = reshape(p * l, size(mps[i], 1), size(mps[i], 2), size(l, 2), size(mps[i], 4))
-            mps[i+1] = ein"ij,jabc->iabc"(u * q, mps[i+1])
+            mps[i] = reshape(p' * l, size(mps[i], 1), size(mps[i], 2), size(l, 2), size(mps[i], 4))
+            mps[i+1] = ein"ij,jabc->iabc"(u * q', mps[i+1])
         end
 
         for i in L:-1:2
             p, l, u, q = lu_with_complete_pivot(reshape(mps[i], :, size(mps[i], 2) * size(mps[i], 3)))
-            mps[i] = reshape(u * q, size(u, 1), size(mps[i], 2), size(mps[i], 3), size(mps[i], 4))
-            mps[i-1] = ein"abcd,ci->abid"(mps[i-1], p * l)
+            # @assert p'*l*u*q' == reshape(mps[i], :, size(mps[i], 2) * size(mps[i], 3))
+            mps[i] = reshape(u * q', size(u, 1), size(mps[i], 2), size(mps[i], 3), size(mps[i], 4))
+            mps[i-1] = ein"abcd,ci->abid"(mps[i-1], p' * l)
         end
         @show size.(mps, 1)
     end
     return
 end
 
-function lu_with_complete_pivot(A::AbstractMatrix)
+function lu_with_complete_pivot(A::AbstractMatrix{T}) where T
     n, m = size(A)
 
-    P = Matrix(I(n))
-    Q = Matrix(I(m))
-    L = zeros(typeof(A[1, 1]), n, n)
+    P = Matrix{T}(I(n))
+    Q = Matrix{T}(I(m))
+    L = zeros(T, n, n)
     U = copy(A)
+
 
     ranka = min(n, m)
     for k in 1:min(n, m)
@@ -110,7 +127,7 @@ function lu_with_complete_pivot(A::AbstractMatrix)
         # index = argmax(abs.(U[k:end, k:end]))
         subU = view(U, k:n, k:m)
         # TODO: fix the bug in Mods
-        index = findfirst(x -> !iszero(x.val % Mods.modulus(x)), subU)
+        index = findfirst(!iszero, subU)
         if isnothing(index)
             ranka = k - 1
             break
@@ -120,7 +137,9 @@ function lu_with_complete_pivot(A::AbstractMatrix)
         pivot_row += k - 1
         pivot_col += k - 1
         # Swap rows in U and P
+
         U[[k, pivot_row], :] = U[[pivot_row, k], :]
+        L[[k, pivot_row], :] = L[[pivot_row, k], :]
         P[[k, pivot_row], :] = P[[pivot_row, k], :]
 
         # Swap columns in U and Q
@@ -134,6 +153,8 @@ function lu_with_complete_pivot(A::AbstractMatrix)
         end
     end
 
-    L[1:ranka, 1:ranka] += I(ranka)  # Add identity to L
+    # L[1:ranka, 1:ranka] += I(ranka)  # Add identity to L
+
+    L += I(n) 
     return P, L[:, 1:ranka], U[1:ranka, :], Q
 end
